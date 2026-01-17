@@ -15,18 +15,20 @@ int nh3Samples[GAS_FILTER_SIZE];
 uint8_t gasIndex = 0;
 bool filterFilled = false;
 
-bool dailyReportEnabled = false;
+bool dailyReportEnabled = true;
 float lastValidTemp = 25.0;
 float lastValidHum  = 50.0;
 
 // ================== ALERT STATE FLAGS ==================
 bool smsSentForCurrentAlert = false;
 bool lastAlertState = false;
-
+int activeContacts = 0;
 // ================== MULTI CONTACT SUPPORT ==================
 #define MAX_CONTACTS 5
 #define MAX_ATTEMPTS_PER_NUMBER 2
 
+
+String activePhoneList[MAX_CONTACTS];
 String phoneNumbers[MAX_CONTACTS] = {
   "+918010845905",
   "+911111111111",
@@ -68,6 +70,18 @@ void updateDailyStats(float t, float h) {
   todayStats.minHum  = min(todayStats.minHum, h);
   todayStats.maxHum  = max(todayStats.maxHum, h);
 }
+void updateActiveContacts() {
+  activeContacts = 0;
+
+  for (int i = 0; i < MAX_CONTACTS; i++) {
+    if (phoneNumbers[i].length() >= 10) {
+      activePhoneList[activeContacts] = phoneNumbers[i];
+      activeContacts++;
+    }
+  }
+}
+
+
 
 // ===== FUNCTION PROTOTYPES =====
 String sendATCommand(const char *cmd, uint32_t waitMs );
@@ -207,7 +221,7 @@ bool callInProgress = false;
 #define X_OFFSET 0
   
 // ================== WEB SERVER HTML ==================
-const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
+const char CONFIG_PAGE[] PROGMEM =R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -300,13 +314,13 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 <body>
 <div class="container">
 
-<h1>  ]= Environment Monitor</h1>
+<h1>Environment Monitor</h1>
 <p style="text-align:center; color:#888; font-size:14px;">Configuration Panel</p>
 
 <div class="current-settings">
-  <h2 style="margin-top:0; border:none;"> Current Settings</h2>
+  <h2 style="margin-top:0; border:none;">Current Settings</h2>
   <div><strong>Contacts:</strong> <span id="displayPhone">Loading...</span></div>
-  <div><strong>Daily Report:</strong> <span id="displayReport">Loading...</span></div>
+  <div><strong>Daily Report:</strong> Enabled (8:00 AM)</div>
   <div><strong>Temperature:</strong> <span id="displayTemp">Loading...</span> °C</div>
   <div><strong>Humidity:</strong> <span id="displayHum">Loading...</span> %</div>
 </div>
@@ -315,7 +329,7 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 
 <h2>Emergency Contacts (Call Order)</h2>
 
-<div class="form-group"><input type="tel" id="phone0" placeholder="+918010845905" required></div>
+<div class="form-group"><input type="tel" id="phone0" placeholder="+91XXXXXXXXXX" required></div>
 <div class="form-group"><input type="tel" id="phone1" placeholder="+91XXXXXXXXXX"></div>
 <div class="form-group"><input type="tel" id="phone2" placeholder="+91XXXXXXXXXX"></div>
 <div class="form-group"><input type="tel" id="phone3" placeholder="+91XXXXXXXXXX"></div>
@@ -323,7 +337,7 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 
 <p class="hint">System will call each number twice in order until someone answers.</p>
 
-<h2> Temperature Limits</h2>
+<h2>Temperature Limits</h2>
 <div class="form-group">
   <div class="range-inputs">
     <input type="number" step="0.1" id="tlow" placeholder="Min (e.g., 10)" required>
@@ -331,7 +345,7 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
   </div>
 </div>
 
-<h2> Humidity Limits</h2>
+<h2>Humidity Limits</h2>
 <div class="form-group">
   <div class="range-inputs">
     <input type="number" step="0.1" id="hlow" placeholder="Min (e.g., 30)" required>
@@ -339,21 +353,13 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
   </div>
 </div>
 
-<h2>Daily Summary Report</h2>
-<div class="form-group">
-  <label>
-    <input type="checkbox" id="dailyReport">
-    Enable Daily Report SMS (8:00 AM)
-  </label>
-</div>
-
-<button type="submit"> Save All Settings</button>
-<button type="button" class="test-btn" onclick="testSMS()"> Test SMS</button>
-<button type="button" class="test-btn" onclick="testCall()"> Test Call</button>
+<button type="submit">Save All Settings</button>
+<button type="button" class="test-btn" onclick="testSMS()">Test SMS</button>
+<button type="button" class="test-btn" onclick="testCall()">Test Call</button>
 
 </form>
 
-<div class="success" id="successMsg"> Settings saved successfully!</div>
+<div class="success" id="successMsg">Settings saved successfully!</div>
 
 </div>
 
@@ -362,19 +368,38 @@ function loadSettings() {
   fetch('/getSettings')
     .then(r => r.json())
     .then(data => {
+
+      // Phones
       let contacts = [];
       for (let i = 0; i < 5; i++) {
         const key = "phone" + i;
         document.getElementById(key).value = data[key] || "";
         if (data[key]) contacts.push(data[key]);
       }
-      displayPhone.textContent = contacts.length ? contacts.join(', ') : 'Not configured';
-      displayTemp.textContent = data.tlow + ' to ' + data.thigh;
-      displayHum.textContent = data.hlow + ' to ' + data.hhigh;
-      dailyReport.checked = data.dailyReport;
-      displayReport.textContent = data.dailyReport ? "Enabled (8:00 AM)" : "Disabled";
+
+      displayPhone.textContent = contacts.length
+        ? contacts.join(', ')
+        : 'Not configured';
+
+      // ✅ SET INPUT VALUES (THIS WAS MISSING)
+      document.getElementById('tlow').value  = data.tlow ?? '';
+      document.getElementById('thigh').value = data.thigh ?? '';
+      document.getElementById('hlow').value  = data.hlow ?? '';
+      document.getElementById('hhigh').value = data.hhigh ?? '';
+
+      // Display text
+      displayTemp.textContent =
+        (data.tlow !== undefined && data.thigh !== undefined)
+          ? data.tlow + ' to ' + data.thigh
+          : 'Not configured';
+
+      displayHum.textContent =
+        (data.hlow !== undefined && data.hhigh !== undefined)
+          ? data.hlow + ' to ' + data.hhigh
+          : 'Not configured';
     });
 }
+
 
 loadSettings();
 
@@ -383,15 +408,15 @@ document.getElementById('configForm').addEventListener('submit', e => {
 
   let data = '';
   for (let i = 0; i < 5; i++) {
-    data += 'phone' + i + '=' + encodeURIComponent(document.getElementById('phone' + i).value) + '&';
+    data += 'phone' + i + '=' +
+      encodeURIComponent(document.getElementById('phone' + i).value) + '&';
   }
 
   data +=
     'tlow=' + tlow.value +
     '&thigh=' + thigh.value +
     '&hlow=' + hlow.value +
-    '&hhigh=' + hhigh.value +
-    '&dailyReport=' + (dailyReport.checked ? '1' : '0');
+    '&hhigh=' + hhigh.value;
 
   fetch('/setSettings', {
     method: 'POST',
@@ -552,109 +577,114 @@ bool makeDirectCall(String phoneNumber) {
 void checkCallStatus() {
   if (!callInProgress) return;
 
-  String response = sendATCommand("AT+CLCC", 1500);
-  response = filterASCII(response);
+  String response = filterASCII(sendATCommand("AT+CLCC", 1500));
 
   int idx = response.indexOf("+CLCC:");
   if (idx < 0) {
- if (millis() - callStartTime > CALL_TIMEOUT) {
-  Serial.println("⏱ Call timeout, moving to next number");
-  hangupCall();
-  callInProgress = false;
-  callState = CALL_IDLE;
-  attemptsForCurrentNumber = MAX_ATTEMPTS_PER_NUMBER;
-}
-
+    if (millis() - callStartTime > CALL_TIMEOUT) {
+      Serial.println("⏱ Call timeout");
+      hangupCall();
+    }
     return;
   }
 
-  int p1 = response.indexOf(',', idx);
-  int p2 = response.indexOf(',', p1 + 1);
+  int p2 = response.indexOf(',', idx);
+  p2 = response.indexOf(',', p2 + 1);
   int p3 = response.indexOf(',', p2 + 1);
-
-  if (p1 < 0 || p2 < 0 || p3 < 0) return;
+  if (p2 < 0 || p3 < 0) return;
 
   int stat = response.substring(p2 + 1, p3).toInt();
 
   switch (stat) {
 
-    
     case 0: // ANSWERED
-  Serial.println("✅ CALL ANSWERED – STOPPING ALERTS");
-  callState = CALL_CONNECTED;
-  alertAcknowledged = true;
-  delay(10000);
-  hangupCall();
-  callInProgress = false;
-  break;
+      Serial.println("✅ CALL ANSWERED – ALERT ACKNOWLEDGED");
+      alertAcknowledged = true;
+      callState = CALL_CONNECTED;
+      delay(5000);
+      hangupCall();
+      break;
 
-
-    case 3:
+    case 3: // RINGING
       callState = CALL_RINGING;
       break;
 
-    case 6:
-      Serial.println("Call rejected/busy");
+    case 6: // BUSY / REJECTED
+      Serial.println("📵 Call rejected/busy");
       hangupCall();
-      callInProgress = false;
-      callState = CALL_IDLE;
       break;
   }
 }
+
 
 void sendParametersSMS(float temp, float hum, int gas, int nh3, bool fire) {
   String message = "ENV MONITOR:\n";
   message += "Temp: " + String(temp, 1) + "C\n";
   message += "Humidity: " + String(hum, 0) + "%\n";
-  message += "Gas: " + String(gas) + " PPM\n";
-  message += "NH3: " + String(nh3) + " PPM\n";
+  message += "Carbon Monoxide: " + String(gas) + " PPM\n";
+  message += "Ammonia: " + String(nh3) + " PPM\n";
   message += "Fire: " + String(fire ? "YES" : "NO");
   
  sendSMS(phoneNumbers[0], message);
 
 }
 
+void resetCallState() {
+  currentContactIndex = 0;
+  attemptsForCurrentNumber = 0;
+  callInProgress = false;
+  alertAcknowledged = false;
+  callState = CALL_IDLE;   // 🔥 IMPORTANT
+}
+
+
 void handleAlerts(float temp, float hum, int gas, int nh3, bool fire) {
 
-  if (alertAcknowledged) return;
-
-  bool shouldAlert =
+  bool alertActive =
     fire ||
     (temp < TEMP_LOW || temp > TEMP_HIGH) ||
     (hum < HUM_LOW || hum > HUM_HIGH) ||
     (gas > GAS_LIMIT) ||
     (nh3 > AMMONIA_LIMIT);
 
-if (!shouldAlert) {
-  currentContactIndex = 0;
-  attemptsForCurrentNumber = 0;
-  callAttempts = 0;
-  alertAcknowledged = false;
-  return;
-}
+  // 🟢 ALERT CLEARED → STOP EVERYTHING
+  if (!alertActive) {
+    resetCallState();
+    return;
+  }
 
+  // ❌ No contacts configured
+  if (activeContacts == 0) return;
 
+  // 🛑 Someone already answered
+  if (alertAcknowledged) return;
+
+  // 📞 Ongoing call → monitor
   if (callInProgress) {
     checkCallStatus();
     return;
   }
 
-  if (currentContactIndex >= MAX_CONTACTS) {
-    Serial.println("❌ All contacts tried. No answer.");
-    return;
+  // 🔁 Wrap index when reaching active contacts
+  if (currentContactIndex >= activeContacts) {
+    currentContactIndex = 0;
   }
 
+  // ⏳ Retry delay
   if (millis() - lastCallAttempt < RETRY_DELAY) return;
 
-  Serial.printf("📞 Calling %s (Attempt %d)\n",
-                phoneNumbers[currentContactIndex].c_str(),
-                attemptsForCurrentNumber + 1);
+  Serial.printf("📞 Calling contact %d/%d (Attempt %d/2)\n",
+    currentContactIndex + 1,
+    activeContacts,
+    attemptsForCurrentNumber + 1
+  );
 
-  makeDirectCall(phoneNumbers[currentContactIndex]);
+  makeDirectCall(activePhoneList[currentContactIndex]);
+
   lastCallAttempt = millis();
   attemptsForCurrentNumber++;
-  callAttempts++;
 
+  // 🔂 Move after 2 attempts
   if (attemptsForCurrentNumber >= MAX_ATTEMPTS_PER_NUMBER) {
     attemptsForCurrentNumber = 0;
     currentContactIndex++;
@@ -704,8 +734,9 @@ void handleSetSettings() {
   preferences.putFloat("hlow", HUM_LOW);
   preferences.putFloat("hhigh", HUM_HIGH);
 
-  dailyReportEnabled = server.arg("dailyReport") == "1";
-  preferences.putBool("dailyReport", dailyReportEnabled);
+  updateActiveContacts();
+
+
 
   server.send(200, "application/json", "{\"success\":true}");
 }
@@ -721,6 +752,28 @@ void handleTestCall() {
 }
 
 // ================== DISPLAY UTILITIES ==================
+
+void lcdScanAnimation() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  // Draw faint background grid (optional but looks premium)
+  for (int y = 0; y < 240; y += 8) {
+    tft.drawFastHLine(0, y, 240, 0x18E3); // dark blue-gray
+  }
+
+  // Moving scan line
+  for (int y = 0; y < 240; y += 4) {
+    tft.fillRect(0, y - 4, 240, 8, ST77XX_BLACK);   // erase old line
+    tft.drawFastHLine(0, y, 240, ST77XX_CYAN);     // scan line
+    delay(6);
+  }
+
+  // Flash effect at end
+  tft.fillScreen(ST77XX_CYAN);
+  delay(80);
+  tft.fillScreen(ST77XX_BLACK);
+}
+
 void drawRoundedCard(int x, int y, int w, int h, uint16_t bgColor, uint16_t borderColor) {
   tft.fillRoundRect(x, y, w, h, 6, bgColor);
   tft.drawRoundRect(x, y, w, h, 6, borderColor);
@@ -840,131 +893,141 @@ void updateDisplay(float t, float h, int gas, int nh3, int flame) {
 
 // ================== SETUP ==================
 void setup() {
-  
+
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n\n=== ENVIRONMENT MONITOR STARTING ===");
-  
+  delay(300);
+  Serial.println("\n=== ENVIRONMENT MONITOR STARTING ===");
+
+  // ----------------- SENSOR INIT -----------------
   pinMode(FLAME_PIN, INPUT);
   dht.begin();
   Serial.println("✓ Sensors initialized");
-  
-  Serial.println("Initializing display...");
-  tft.init(240, 280);
-  tft.setRotation(1);
-  tft.setAddrWindow(X_OFFSET, 0, 240 + X_OFFSET, 240);
-  tft.fillScreen(0x0000);
-  displayReady = true;
-  Serial.println("✓ Display ready");
-  
-  if (DISPLAY_TEST_MODE) {
-    tft.fillScreen(ST77XX_RED);
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(30, 90);
-    tft.print("DISPLAY");
-    tft.setCursor(55, 120);
-    tft.print("TEST");
-    while(1) delay(1000);
-  }
-  
-  tft.fillScreen(0x0349);
+
+  // ----------------- DISPLAY INIT (FIXED) -----------------
+ // 🔥 Run scan animation (NO re-init)
+
+ // ----------------- DISPLAY INIT (REQUIRED) -----------------
+tft.init(240, 280);
+tft.setRotation(1);
+tft.setAddrWindow(X_OFFSET, 0, 240 + X_OFFSET, 240);
+tft.fillScreen(ST77XX_BLACK);
+
+tft.fillScreen(ST77XX_BLACK);
+
+for (int y = 0; y < 240; y += 4) {
+  tft.drawFastHLine(0, y, 240, ST77XX_CYAN);
+  delay(6);
+  tft.drawFastHLine(0, y, 240, ST77XX_BLACK);
+}
+
+tft.fillScreen(ST77XX_BLACK);
+
+
+  // ----------------- BOOT LOGO -----------------
+  tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(3);
-  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextColor(ST77XX_CYAN);
   tft.setCursor(35, 90);
   tft.print("ENV");
   tft.setCursor(20, 120);
   tft.print("MONITOR");
-  
-  for (int i = 0; i < 200; i += 10) {
-    tft.fillRect(20 + i, 165, 8, 6, ST77XX_GREEN);
-    delay(50);
-  }
-  
-  tft.fillScreen(0x0000);
+  delay(1200);
 
-  // Load preferences
+  displayReady = true;
+  Serial.println("✓ Display ready");
+
+  // ----------------- DISPLAY TEST MODE -----------------
+  if (DISPLAY_TEST_MODE) {
+    tft.fillScreen(ST77XX_RED);
+    tft.setTextSize(3);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(30, 100);
+    tft.print("DISPLAY");
+    tft.setCursor(55, 140);
+    tft.print("TEST");
+    while (1) delay(1000);
+  }
+
+  // ----------------- LOAD PREFERENCES -----------------
   preferences.begin("envmonitor", false);
- 
 
   for (int i = 0; i < MAX_CONTACTS; i++) {
-  String key = "phone" + String(i);
-  phoneNumbers[i] = preferences.getString(key.c_str(), phoneNumbers[i]);
-}
+    String key = "phone" + String(i);
+    phoneNumbers[i] = preferences.getString(key.c_str(), phoneNumbers[i]);
+  }
 
- dailyReportEnabled = preferences.getBool("dailyReport", false);
+ dailyReportEnabled = true;
 
 
-  TEMP_LOW = preferences.getFloat("tlow", 10.0);
+  TEMP_LOW  = preferences.getFloat("tlow", 10.0);
   TEMP_HIGH = preferences.getFloat("thigh", 35.0);
-  HUM_LOW = preferences.getFloat("hlow", 30.0);
-  HUM_HIGH = preferences.getFloat("hhigh", 80.0);
-  Serial.println("✓ Preferences loaded");
+  HUM_LOW   = preferences.getFloat("hlow", 30.0);
+  HUM_HIGH  = preferences.getFloat("hhigh", 80.0);
+
+  updateActiveContacts();
   resetDailyStats();
 
-  
-  // Start WiFi AP
-  Serial.println("Starting WiFi Access Point...");
+  Serial.println("✓ Preferences loaded");
+
+  // ----------------- WIFI AP -----------------
+  Serial.println("Starting WiFi AP...");
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   IPAddress IP = WiFi.softAPIP();
-  Serial.print("✓ AP IP address: ");
+  Serial.print("✓ AP IP: ");
   Serial.println(IP);
-  
-  // Configure web server routes
+
   server.on("/", handleRoot);
+  server.on("/getSettings", handleGetSettings);
+  server.on("/setSettings", HTTP_POST, handleSetSettings);
+  server.on("/testSMS", HTTP_POST, handleTestSMS);
+  server.on("/testCall", HTTP_POST, handleTestCall);
+  server.begin();
 
-server.on("/getSettings", handleGetSettings);
-server.on("/setSettings", HTTP_POST, handleSetSettings);
-server.on("/testSMS", HTTP_POST, handleTestSMS);
-server.on("/testCall", HTTP_POST, handleTestCall);
+  Serial.println("✓ Web server started");
 
-server.begin();
-Serial.println("✓ Web server started");
-
-  
-  // Display WiFi info on screen
-  tft.fillScreen(0x0000);
+  // ----------------- SHOW WIFI INFO -----------------
+  tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(20, 40);
+  tft.setCursor(20, 30);
   tft.print("WiFi Ready");
+
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 70);
-  tft.print("SSID: ");
-  tft.print(AP_SSID);
-  tft.setCursor(10, 85);
-  tft.print("Password: ");
-  tft.print(AP_PASSWORD);
-  tft.setCursor(10, 100);
-  tft.print("IP: ");
-  tft.print(IP);
-  tft.setTextSize(1);
+  tft.setCursor(10, 60);
+  tft.print("SSID: "); tft.print(AP_SSID);
+  tft.setCursor(10, 75);
+  tft.print("PASS: "); tft.print(AP_PASSWORD);
+  tft.setCursor(10, 90);
+  tft.print("IP: ");   tft.print(IP);
+
   tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(10, 130);
-  tft.print("Connect to configure");
-  tft.setCursor(10, 145);
-  tft.print("thresholds & phone");
-  delay(5000);
-  
-  // Initialize A7670 modem
+  tft.setCursor(10, 120);
+  tft.print("Open browser to");
+  tft.setCursor(10, 135);
+  tft.print("configure settings");
+
+  delay(4000);
+
+  // ----------------- MODEM INIT -----------------
   Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
   powerOnModem();
   delay(5000);
   initModem();
   Serial.println("✓ Modem initialized");
-  
-  // Display ready message
-  tft.fillScreen(0x0000);
+
+  // ----------------- READY SCREEN -----------------
+  tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_GREEN);
-  tft.setCursor(30, 100);
+  tft.setCursor(30, 110);
   tft.print("SYSTEM READY");
+
   delay(2000);
-  
-  Serial.println("\n=== MONITORING ACTIVE ===\n");
+  Serial.println("=== MONITORING ACTIVE ===");
 }
+
 
 float getSensorResistance(int adcValue, float RL) {
   float voltage = (adcValue / ADC_MAX) * ADC_VREF;
