@@ -23,10 +23,10 @@ float lastValidHum  = 50.0;
 bool smsSentForCurrentAlert = false;
 bool lastAlertState = false;
 int activeContacts = 0;
+
 // ================== MULTI CONTACT SUPPORT ==================
 #define MAX_CONTACTS 5
 #define MAX_ATTEMPTS_PER_NUMBER 2
-
 
 String activePhoneList[MAX_CONTACTS];
 String phoneNumbers[MAX_CONTACTS] = {
@@ -53,7 +53,6 @@ struct DailyStats {
 DailyStats todayStats;
 int lastRecordedDay = -1;
 
-
 void resetDailyStats() {
   todayStats.minTemp = 1000;
   todayStats.maxTemp = -1000;
@@ -70,6 +69,7 @@ void updateDailyStats(float t, float h) {
   todayStats.minHum  = min(todayStats.minHum, h);
   todayStats.maxHum  = max(todayStats.maxHum, h);
 }
+
 void updateActiveContacts() {
   activeContacts = 0;
 
@@ -81,13 +81,9 @@ void updateActiveContacts() {
   }
 }
 
-
-
 // ===== FUNCTION PROTOTYPES =====
-String sendATCommand(const char *cmd, uint32_t waitMs );
-
+String sendATCommand(const char *cmd, uint32_t waitMs);
 bool sendSMS(String phoneNumber, String message);
-
 bool getNetworkTime(int &hour, int &minute, int &day);
 
 bool getNetworkTime(int &hour, int &minute, int &day) {
@@ -96,13 +92,20 @@ bool getNetworkTime(int &hour, int &minute, int &day) {
   int q2 = resp.indexOf("\"", q1 + 1);
   if (q1 < 0 || q2 < 0) return false;
 
-  String t = resp.substring(q1 + 1, q2); // yy/MM/dd,hh:mm:ss
+  String t = resp.substring(q1 + 1, q2);
+  
+  // Check if time is valid (not 1970)
+  String year = t.substring(0, 2);
+  if (year.toInt() < 20) {
+    Serial.println("⚠ Network time not synchronized yet");
+    return false;
+  }
+  
   day = t.substring(6, 8).toInt();
   hour = t.substring(9, 11).toInt();
   minute = t.substring(12, 14).toInt();
   return true;
 }
-
 
 void checkDailyReport() {
   if (!dailyReportEnabled) return;
@@ -125,23 +128,14 @@ void checkDailyReport() {
 }
 
 // ===== SENSOR CALIBRATION =====
-
-// ESP32 ADC
 #define ADC_MAX 4095.0
 #define ADC_VREF 3.3
-
-// MQ-2 (Gas) Approx Calibration
-#define MQ2_RL 10.0      // Load resistance (kΩ)
-#define MQ2_R0 9.83      // Calibrated in clean air (adjust once)
-
-// MQ-137 (NH3) Approx Calibration
+#define MQ2_RL 10.0
+#define MQ2_R0 9.83
 #define MQ137_RL 10.0
-#define MQ137_R0 12.0    // Calibrated in clean air
-
-// Limits (realistic)
+#define MQ137_R0 12.0
 #define GAS_MAX_PPM   5000
 #define NH3_MAX_PPM   300
-
 
 // ================== DHT ==================
 #define DHTPIN 2
@@ -177,7 +171,7 @@ String TO_PHONE_NUMBER = "+918010845905";
 
 // ================== THRESHOLDS ==================
 int GAS_LIMIT = 1800;
-int AMMONIA_LIMIT = 1600;
+int AMMONIA_LIMIT = 200;
 float TEMP_LOW  = 10.0;
 float TEMP_HIGH = 35.0;
 float HUM_LOW   = 30.0;
@@ -185,7 +179,7 @@ float HUM_HIGH  = 80.0;
 
 // ================== SMS TIMING ==================
 unsigned long lastSMSTime = 0;
-const unsigned long SMS_INTERVAL = 30000;  // 30 seconds
+const unsigned long SMS_INTERVAL = 30000;
 
 // ================== DISPLAY TIMING ==================
 unsigned long lastDisplayUpdate = 0;
@@ -207,7 +201,7 @@ unsigned long lastCallAttempt = 0;
 int callAttempts = 0;
 const int MAX_CALL_ATTEMPTS = 5;
 const unsigned long CALL_TIMEOUT = 45000;
-const unsigned long RETRY_DELAY = 10000;
+const unsigned long RETRY_DELAY = 3000;  // ✅ REDUCED TO 3 SECONDS
 const unsigned long ALERT_COOLDOWN = 300000;
 unsigned long alertCooldownStart = 0;
 
@@ -216,12 +210,10 @@ bool callInProgress = false;
 
 // ================== DISPLAY TEST MODE ==================
 #define DISPLAY_TEST_MODE false
-
-// ================== DISPLAY OFFSET ==================
 #define X_OFFSET 0
   
 // ================== WEB SERVER HTML ==================
-const char CONFIG_PAGE[] PROGMEM =R"rawliteral(
+const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -368,8 +360,6 @@ function loadSettings() {
   fetch('/getSettings')
     .then(r => r.json())
     .then(data => {
-
-      // Phones
       let contacts = [];
       for (let i = 0; i < 5; i++) {
         const key = "phone" + i;
@@ -381,13 +371,11 @@ function loadSettings() {
         ? contacts.join(', ')
         : 'Not configured';
 
-      // ✅ SET INPUT VALUES (THIS WAS MISSING)
       document.getElementById('tlow').value  = data.tlow ?? '';
       document.getElementById('thigh').value = data.thigh ?? '';
       document.getElementById('hlow').value  = data.hlow ?? '';
       document.getElementById('hhigh').value = data.hhigh ?? '';
 
-      // Display text
       displayTemp.textContent =
         (data.tlow !== undefined && data.thigh !== undefined)
           ? data.tlow + ' to ' + data.thigh
@@ -399,7 +387,6 @@ function loadSettings() {
           : 'Not configured';
     });
 }
-
 
 loadSettings();
 
@@ -514,50 +501,176 @@ String sendATCommand(const char *cmd, uint32_t waitMs = 2000) {
 
 void initModem() {
   Serial.println("Initializing modem...");
+  
   sendAT("AT", 500);
-  sendAT("AT+CFUN=1", 1000);
+  
+  // Set full functionality mode
+  sendAT("AT+CFUN=1", 2000);
+  delay(2000);
+  
+  // Set Airtel APN for data/voice
+  sendAT("AT+CGDCONT=1,\"IP\",\"airtelgprs.com\"", 1000);
+  delay(500);
+  
+  // Activate PDP context
+  sendAT("AT+CGACT=1,1", 2000);
+  delay(500);
+  sendAT("AT+CRC=1", 500);   // Call result codes
+  sendAT("AT+CLIP=1", 500);  // Caller ID
+
+  // Attach to network
+  sendAT("AT+CGATT=1", 2000);
+  delay(1000);
+  
+  // Enable VoLTE if available
+  sendAT("AT+CVOLTE=1", 1000);
+  delay(500);
+  
+  // Enable IMS for voice over LTE
+  sendAT("AT+QCFG=\"ims\",1", 1000);
+  delay(500);
+  
+  // Set network mode to automatic (LTE + 3G + 2G)
+  sendAT("AT+CNMP=2", 1000);
+  
+  // Wait for network registration (accepts status 6 for LTE voice)
+  Serial.println("Waiting for network...");
+  bool registered = false;
+  
+  for (int i = 0; i < 60; i++) {
+    String resp = sendATCommand("AT+CREG?", 1000);
+    
+    // Accept status 1, 5, or 6 (6 is OK for LTE with VoLTE)
+    if (resp.indexOf("+CREG: 0,1") >= 0 || 
+        resp.indexOf("+CREG: 0,5") >= 0 || 
+        resp.indexOf("+CREG: 0,6") >= 0) {
+      Serial.println("\n✅ Network registered!");
+      registered = true;
+      break;
+    }
+    
+    Serial.print(".");
+    delay(1000);
+  }
+  
+  if (!registered) {
+    Serial.println("\n⚠ Warning: Network registration incomplete");
+  }
+  
+  // Check signal strength
+  String csq = sendATCommand("AT+CSQ", 1000);
+  Serial.println("Signal: " + csq);
+  
+  // Check network operator
+  String cops = sendATCommand("AT+COPS?", 2000);
+  Serial.println("Operator: " + cops);
+  
+  // Verify APN
+  String apn = sendATCommand("AT+CGDCONT?", 1000);
+  Serial.println("APN: " + apn);
+  
+  // SMS settings
   sendAT("AT+CMGF=1", 500);
   sendAT("AT+CSCS=\"GSM\"", 500);
+  
+  // Voice call settings
+  sendAT("AT+CLIP=1", 500);
+  sendAT("AT+CLCC=1", 500);
+  
   Serial.println("Modem ready.");
 }
 
 bool sendSMS(String phoneNumber, String message) {
   Serial.println("Sending SMS to: " + phoneNumber);
   Serial.println("Message: " + message);
+  Serial.println("Message length: " + String(message.length()));
   
-  sendAT("AT+CMGF=1", 1000);
+  // Clear buffer first
+  while (Serial1.available()) Serial1.read();
   
+  // Set text mode
+  Serial1.println("AT+CMGF=1");
+  delay(500);
+  while (Serial1.available()) Serial1.read();
+  
+  // Set encoding to GSM
+  Serial1.println("AT+CSCS=\"GSM\"");
+  delay(300);
+  while (Serial1.available()) Serial1.read();
+  
+  // Send CMGS command
   String cmd = "AT+CMGS=\"" + phoneNumber + "\"";
   Serial1.println(cmd);
-  delay(500);
+  delay(1000);
   
+  // Wait for > prompt
+  unsigned long promptStart = millis();
+  bool gotPrompt = false;
+  while (millis() - promptStart < 3000) {
+    if (Serial1.available()) {
+      char c = Serial1.read();
+      Serial.write(c);
+      if (c == '>') {
+        gotPrompt = true;
+        break;
+      }
+    }
+  }
+  
+  if (!gotPrompt) {
+    Serial.println("ERROR: No > prompt received");
+    return false;
+  }
+  
+  // Send message
   Serial1.print(message);
   delay(100);
-  Serial1.write(26);
+  Serial1.write(26);  // CTRL+Z
+  Serial1.flush();
   
+  // Wait for response
   unsigned long start = millis();
   String response = "";
-  while (millis() - start < 10000) {
+  bool success = false;
+  
+  while (millis() - start < 15000) {
     if (Serial1.available()) {
       char c = Serial1.read();
       response += c;
       Serial.write(c);
-      if (response.indexOf("OK") >= 0) {
-        Serial.println("SMS sent successfully!");
+      
+      if (response.indexOf("+CMGS:") >= 0) {
+        success = true;
+      }
+      
+      if (response.indexOf("OK") >= 0 && success) {
+        Serial.println("\n✅ SMS sent successfully!");
         return true;
       }
-      if (response.indexOf("ERROR") >= 0) {
-        Serial.println("SMS failed!");
+      
+      if (response.indexOf("ERROR") >= 0 || response.indexOf("+CMS ERROR") >= 0) {
+        Serial.println("\n❌ SMS failed with error");
         return false;
       }
     }
   }
   
-  Serial.println("SMS timeout!");
+  Serial.println("\n⏱ SMS timeout!");
   return false;
 }
 
 bool makeDirectCall(String phoneNumber) {
+  // Check network status - accept 1, 5, or 6 for LTE
+  String creg = sendATCommand("AT+CREG?", 1000);
+  
+  if (creg.indexOf("+CREG: 0,1") < 0 && 
+      creg.indexOf("+CREG: 0,5") < 0 && 
+      creg.indexOf("+CREG: 0,6") < 0) {
+    Serial.println("❌ No network - cannot make call");
+    Serial.println("Status: " + creg);
+    return false;
+  }
+  
   sendAT("ATH", 500);
   delay(300);
 
@@ -568,7 +681,12 @@ bool makeDirectCall(String phoneNumber) {
     callInProgress = true;
     callStartTime = millis();
     callState = CALL_DIALING;
+    Serial.println("📞 Call initiated successfully");
     return true;
+  }
+  
+  if (response.indexOf("ERROR") >= 0 || response.indexOf("CME ERROR") >= 0) {
+    Serial.println("❌ Call failed: " + response);
   }
 
   return false;
@@ -580,7 +698,17 @@ void checkCallStatus() {
   String response = filterASCII(sendATCommand("AT+CLCC", 1500));
 
   int idx = response.indexOf("+CLCC:");
+  
+  // ⚡ QUICK DETECTION: No active call means declined/failed
   if (idx < 0) {
+    // Check if call was recently started (give 10 seconds for ringing)
+    if (millis() - callStartTime > 10000) {
+      Serial.println("❌ Call declined or no answer");
+      hangupCall();
+      return;
+    }
+    
+    // If timeout exceeded, hangup
     if (millis() - callStartTime > CALL_TIMEOUT) {
       Serial.println("⏱ Call timeout");
       hangupCall();
@@ -596,7 +724,6 @@ void checkCallStatus() {
   int stat = response.substring(p2 + 1, p3).toInt();
 
   switch (stat) {
-
     case 0: // ANSWERED
       Serial.println("✅ CALL ANSWERED – ALERT ACKNOWLEDGED");
       alertAcknowledged = true;
@@ -616,6 +743,68 @@ void checkCallStatus() {
   }
 }
 
+void resetCallState() {
+  currentContactIndex = 0;
+  attemptsForCurrentNumber = 0;
+  callInProgress = false;
+  alertAcknowledged = false;
+  callState = CALL_IDLE;
+}
+
+// ✅ NEW FUNCTION: Get Alert Reasons
+String getAlertReasons(float temp, float hum, int gas, int nh3, bool fire) {
+  String reason = "";
+
+  if (fire)
+    reason += "🔥 FIRE DETECTED\n";
+
+  if (temp < TEMP_LOW)
+    reason += "❄ TEMP LOW (" + String(temp,1) + "C)\n";
+  else if (temp > TEMP_HIGH)
+    reason += "🔥 TEMP HIGH (" + String(temp,1) + "C)\n";
+
+  if (hum < HUM_LOW)
+    reason += "💧 HUMIDITY LOW (" + String(hum,0) + "%)\n";
+  else if (hum > HUM_HIGH)
+    reason += "💧 HUMIDITY HIGH (" + String(hum,0) + "%)\n";
+
+  if (gas > GAS_LIMIT)
+    reason += "🧪 GAS HIGH (" + String(gas) + " PPM)\n";
+
+  if (nh3 > AMMONIA_LIMIT)
+    reason += "☠ AMMONIA HIGH (" + String(nh3) + " PPM)\n";
+
+  if (reason == "") reason = "Unknown alert\n";
+
+  return reason;
+}
+
+// ✅ COMBINED SMS: Stats + Alert Reason (Single Message)
+void sendCallAlertSMS(String phone, int attempt,
+                      float temp, float hum, int gas, int nh3, bool fire) {
+
+  String msg = "ALERT #" + String(attempt) + "\n";
+  
+  // Alert reasons
+  if (fire) msg += "FIRE! ";
+  if (temp < TEMP_LOW) msg += "COLD ";
+  if (temp > TEMP_HIGH) msg += "HOT ";
+  if (hum < HUM_LOW) msg += "DRY ";
+  if (hum > HUM_HIGH) msg += "WET ";
+  if (gas > GAS_LIMIT) msg += "GAS ";
+  if (nh3 > AMMONIA_LIMIT) msg += "NH3 ";
+  
+  msg += "\n";
+  
+  // Current values
+  msg += "T:" + String(temp,1) + "C ";
+  msg += "H:" + String(hum,0) + "% ";
+  msg += "G:" + String(gas) + " ";
+  msg += "N:" + String(nh3);
+  msg += "\nCalling now";
+
+  sendSMS(phone, msg);
+}
 
 void sendParametersSMS(float temp, float hum, int gas, int nh3, bool fire) {
   String message = "ENV MONITOR:\n";
@@ -625,19 +814,10 @@ void sendParametersSMS(float temp, float hum, int gas, int nh3, bool fire) {
   message += "Ammonia: " + String(nh3) + " PPM\n";
   message += "Fire: " + String(fire ? "YES" : "NO");
   
- sendSMS(phoneNumbers[0], message);
-
+  sendSMS(phoneNumbers[0], message);
 }
 
-void resetCallState() {
-  currentContactIndex = 0;
-  attemptsForCurrentNumber = 0;
-  callInProgress = false;
-  alertAcknowledged = false;
-  callState = CALL_IDLE;   // 🔥 IMPORTANT
-}
-
-
+// ✅ UPDATED handleAlerts Function
 void handleAlerts(float temp, float hum, int gas, int nh3, bool fire) {
 
   bool alertActive =
@@ -647,30 +827,24 @@ void handleAlerts(float temp, float hum, int gas, int nh3, bool fire) {
     (gas > GAS_LIMIT) ||
     (nh3 > AMMONIA_LIMIT);
 
-  // 🟢 ALERT CLEARED → STOP EVERYTHING
   if (!alertActive) {
     resetCallState();
     return;
   }
 
-  // ❌ No contacts configured
   if (activeContacts == 0) return;
 
-  // 🛑 Someone already answered
   if (alertAcknowledged) return;
 
-  // 📞 Ongoing call → monitor
   if (callInProgress) {
     checkCallStatus();
     return;
   }
 
-  // 🔁 Wrap index when reaching active contacts
   if (currentContactIndex >= activeContacts) {
     currentContactIndex = 0;
   }
 
-  // ⏳ Retry delay
   if (millis() - lastCallAttempt < RETRY_DELAY) return;
 
   Serial.printf("📞 Calling contact %d/%d (Attempt %d/2)\n",
@@ -679,20 +853,24 @@ void handleAlerts(float temp, float hum, int gas, int nh3, bool fire) {
     attemptsForCurrentNumber + 1
   );
 
+  // ✅ SEND SMS WITH EACH CALL
+  sendCallAlertSMS(
+    activePhoneList[currentContactIndex],
+    attemptsForCurrentNumber + 1,
+    temp, hum, gas, nh3, fire
+  );
+
   makeDirectCall(activePhoneList[currentContactIndex]);
 
   lastCallAttempt = millis();
   attemptsForCurrentNumber++;
 
-  // 🔂 Move after 2 attempts
   if (attemptsForCurrentNumber >= MAX_ATTEMPTS_PER_NUMBER) {
     attemptsForCurrentNumber = 0;
     currentContactIndex++;
   }
 }
 
-
-  
 // ================== WEB SERVER HANDLERS ==================
 void handleRoot() {
   server.send_P(200, "text/html", CONFIG_PAGE);
@@ -715,7 +893,6 @@ void handleGetSettings() {
   server.send(200, "application/json", json);
 }
 
-
 void handleSetSettings() {
 
   for (int i = 0; i < MAX_CONTACTS; i++) {
@@ -736,8 +913,6 @@ void handleSetSettings() {
 
   updateActiveContacts();
 
-
-
   server.send(200, "application/json", "{\"success\":true}");
 }
 
@@ -752,23 +927,19 @@ void handleTestCall() {
 }
 
 // ================== DISPLAY UTILITIES ==================
-
 void lcdScanAnimation() {
   tft.fillScreen(ST77XX_BLACK);
 
-  // Draw faint background grid (optional but looks premium)
   for (int y = 0; y < 240; y += 8) {
-    tft.drawFastHLine(0, y, 240, 0x18E3); // dark blue-gray
+    tft.drawFastHLine(0, y, 240, 0x18E3);
   }
 
-  // Moving scan line
   for (int y = 0; y < 240; y += 4) {
-    tft.fillRect(0, y - 4, 240, 8, ST77XX_BLACK);   // erase old line
-    tft.drawFastHLine(0, y, 240, ST77XX_CYAN);     // scan line
+    tft.fillRect(0, y - 4, 240, 8, ST77XX_BLACK);
+    tft.drawFastHLine(0, y, 240, ST77XX_CYAN);
     delay(6);
   }
 
-  // Flash effect at end
   tft.fillScreen(ST77XX_CYAN);
   delay(80);
   tft.fillScreen(ST77XX_BLACK);
@@ -898,32 +1069,25 @@ void setup() {
   delay(300);
   Serial.println("\n=== ENVIRONMENT MONITOR STARTING ===");
 
-  // ----------------- SENSOR INIT -----------------
   pinMode(FLAME_PIN, INPUT);
   dht.begin();
   Serial.println("✓ Sensors initialized");
 
-  // ----------------- DISPLAY INIT (FIXED) -----------------
- // 🔥 Run scan animation (NO re-init)
+  tft.init(240, 280);
+  tft.setRotation(1);
+  tft.setAddrWindow(X_OFFSET, 0, 240 + X_OFFSET, 240);
+  tft.fillScreen(ST77XX_BLACK);
 
- // ----------------- DISPLAY INIT (REQUIRED) -----------------
-tft.init(240, 280);
-tft.setRotation(1);
-tft.setAddrWindow(X_OFFSET, 0, 240 + X_OFFSET, 240);
-tft.fillScreen(ST77XX_BLACK);
+  tft.fillScreen(ST77XX_BLACK);
 
-tft.fillScreen(ST77XX_BLACK);
+  for (int y = 0; y < 240; y += 4) {
+    tft.drawFastHLine(0, y, 240, ST77XX_CYAN);
+    delay(6);
+    tft.drawFastHLine(0, y, 240, ST77XX_BLACK);
+  }
 
-for (int y = 0; y < 240; y += 4) {
-  tft.drawFastHLine(0, y, 240, ST77XX_CYAN);
-  delay(6);
-  tft.drawFastHLine(0, y, 240, ST77XX_BLACK);
-}
+  tft.fillScreen(ST77XX_BLACK);
 
-tft.fillScreen(ST77XX_BLACK);
-
-
-  // ----------------- BOOT LOGO -----------------
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(3);
   tft.setTextColor(ST77XX_CYAN);
@@ -936,7 +1100,6 @@ tft.fillScreen(ST77XX_BLACK);
   displayReady = true;
   Serial.println("✓ Display ready");
 
-  // ----------------- DISPLAY TEST MODE -----------------
   if (DISPLAY_TEST_MODE) {
     tft.fillScreen(ST77XX_RED);
     tft.setTextSize(3);
@@ -948,7 +1111,6 @@ tft.fillScreen(ST77XX_BLACK);
     while (1) delay(1000);
   }
 
-  // ----------------- LOAD PREFERENCES -----------------
   preferences.begin("envmonitor", false);
 
   for (int i = 0; i < MAX_CONTACTS; i++) {
@@ -956,8 +1118,7 @@ tft.fillScreen(ST77XX_BLACK);
     phoneNumbers[i] = preferences.getString(key.c_str(), phoneNumbers[i]);
   }
 
- dailyReportEnabled = true;
-
+  dailyReportEnabled = true;
 
   TEMP_LOW  = preferences.getFloat("tlow", 10.0);
   TEMP_HIGH = preferences.getFloat("thigh", 35.0);
@@ -969,7 +1130,6 @@ tft.fillScreen(ST77XX_BLACK);
 
   Serial.println("✓ Preferences loaded");
 
-  // ----------------- WIFI AP -----------------
   Serial.println("Starting WiFi AP...");
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
@@ -986,7 +1146,6 @@ tft.fillScreen(ST77XX_BLACK);
 
   Serial.println("✓ Web server started");
 
-  // ----------------- SHOW WIFI INFO -----------------
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_CYAN);
@@ -1010,14 +1169,12 @@ tft.fillScreen(ST77XX_BLACK);
 
   delay(4000);
 
-  // ----------------- MODEM INIT -----------------
   Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
   powerOnModem();
   delay(5000);
   initModem();
   Serial.println("✓ Modem initialized");
 
-  // ----------------- READY SCREEN -----------------
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_GREEN);
@@ -1028,21 +1185,17 @@ tft.fillScreen(ST77XX_BLACK);
   Serial.println("=== MONITORING ACTIVE ===");
 }
 
-
 float getSensorResistance(int adcValue, float RL) {
   float voltage = (adcValue / ADC_MAX) * ADC_VREF;
   if (voltage <= 0.01) voltage = 0.01;
   return ((ADC_VREF - voltage) * RL) / voltage;
 }
 
-// MQ-2 → GAS (Approx PPM)
 int getGasPPM(int adc) {
-  // Linear approximation from working raw ADC
   return constrain(map(adc, 300, 3800, 0, 5000), 0, 5000);
 }
 
 int getNH3PPM(int adc) {
-  // Linear approximation for MQ-137
   return constrain(map(adc, 300, 3800, 0, 300), 0, 300);
 }
 
@@ -1060,19 +1213,43 @@ int smoothValue(int *buffer, int newValue) {
 }
 
 
+void processModemURC() {
+  static String urc = "";
+
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n') {
+      urc.trim();
+
+      if (urc.length()) {
+        Serial.println("📡 URC: " + urc);
+
+        // 🔥 IMMEDIATE DECLINE DETECTION
+        if (urc.indexOf("NO CARRIER") >= 0 ||
+            urc.indexOf("BUSY") >= 0 ||
+            urc.indexOf("CALL END") >= 0) {
+
+          Serial.println("❌ Call ended by remote");
+          hangupCall();
+          callState = CALL_FAILED;
+        }
+      }
+      urc = "";
+    } else {
+      urc += c;
+    }
+  }
+}
+
 // ================== MAIN LOOP ==================
 void loop() {
-  // Handle web server requests
+  processModemURC();
+
   server.handleClient();
   
-  // Update display at regular intervals
   if (displayReady && (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL)) {
     lastDisplayUpdate = millis();
     
-
-
-
-    // Read sensors
     float temperature = dht.readTemperature();
     float humidity = dht.readHumidity();
     int gasADC = analogRead(MQ_GAS_PIN);
@@ -1081,35 +1258,28 @@ void loop() {
     int gasRaw = getGasPPM(gasADC);
     int nh3Raw = getNH3PPM(nh3ADC);
 
-// Moving average smoothing
     int gasValue = smoothValue(gasSamples, gasRaw);
     int nh3Value = smoothValue(nh3Samples, nh3Raw);
 
-// Advance filter index
-gasIndex++;
-if (gasIndex >= GAS_FILTER_SIZE) {
-  gasIndex = 0;
-  filterFilled = true;
-}
+    gasIndex++;
+    if (gasIndex >= GAS_FILTER_SIZE) {
+      gasIndex = 0;
+      filterFilled = true;
+    }
 
     int flameValue = digitalRead(FLAME_PIN);
     
-
     if (isnan(temperature) || temperature < 0 || temperature > 60) temperature = lastValidTemp;
     if (isnan(humidity) || humidity < 0 || humidity > 100) humidity = lastValidHum;
 
-lastValidTemp = temperature;
-lastValidHum  = humidity;
-
+    lastValidTemp = temperature;
+    lastValidHum  = humidity;
 
     updateDailyStats(temperature, humidity);
     checkDailyReport();
-
     
-    // Update display
     updateDisplay(temperature, humidity, gasValue, nh3Value, flameValue);
     
-    // Print to serial
     Serial.println("--- Sensor Readings ---");
     Serial.print("Temperature: "); Serial.print(temperature); Serial.println(" °C");
     Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
@@ -1118,10 +1288,8 @@ lastValidHum  = humidity;
     Serial.print("Flame: "); Serial.println(flameValue == LOW ? "DETECTED" : "None");
     Serial.println();
     
-    // Handle alerts (calls)
     handleAlerts(temperature, humidity, gasValue, nh3Value, flameValue == LOW);
     
-    // Send SMS if threshold exceeded and cooldown passed
     bool alertCondition = 
       (flameValue == LOW) ||
       (temperature < TEMP_LOW || temperature > TEMP_HIGH) ||
@@ -1129,22 +1297,19 @@ lastValidHum  = humidity;
       (gasValue > GAS_LIMIT) ||
       (nh3Value > AMMONIA_LIMIT);
     
- // ===== ONE-TIME SMS PER ALERT =====
-if (alertCondition && !lastAlertState) {
-  Serial.println("🚨 ALERT STARTED → Sending SMS");
-  sendParametersSMS(temperature, humidity, gasValue, nh3Value, flameValue == LOW);
-  smsSentForCurrentAlert = true;
-}
+    if (alertCondition && !lastAlertState) {
+      Serial.println("🚨 ALERT STARTED → Sending SMS");
+      sendParametersSMS(temperature, humidity, gasValue, nh3Value, flameValue == LOW);
+      smsSentForCurrentAlert = true;
+    }
 
-if (!alertCondition && lastAlertState) {
-  Serial.println("✅ ALERT CLEARED");
-  smsSentForCurrentAlert = false;
-}
+    if (!alertCondition && lastAlertState) {
+      Serial.println("✅ ALERT CLEARED");
+      smsSentForCurrentAlert = false;
+    }
 
-lastAlertState = alertCondition;
-
+    lastAlertState = alertCondition;
   }
   
-  // Small delay to prevent watchdog issues
   delay(10);
 }
