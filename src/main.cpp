@@ -16,8 +16,18 @@ uint8_t gasIndex = 0;
 bool filterFilled = false;
 
 bool dailyReportEnabled = true;
+bool buzzerEnabled = true;  // ✅ Buzzer can be disabled via web interface
 float lastValidTemp = 25.0;
 float lastValidHum  = 50.0;
+
+// ================== BUZZER ==================
+#define BUZZER_PIN 25  // Change this to your preferred GPIO pin
+bool buzzerActive = false;
+unsigned long buzzerLastToggle = 0;
+const unsigned long BUZZER_ALERT_INTERVAL = 500;  // Slower beep for general alerts
+const unsigned long BUZZER_CALL_INTERVAL = 200;   // Fast ringtone during calls
+
+// buzzerUpdate() defined after CallState enum below
 
 // ================== ALERT STATE FLAGS ==================
 bool smsSentForCurrentAlert = false;
@@ -41,6 +51,48 @@ int currentContactIndex = 0;
 int attemptsForCurrentNumber = 0;
 bool alertAcknowledged = false;
 
+// ================== TIME MANAGEMENT ==================
+struct NetworkTime {
+  int hour;
+  int minute;
+  int second;
+  int day;
+  int month;
+  int year;
+  bool valid;
+};
+
+NetworkTime currentTime = {0, 0, 0, 1, 1, 2025, false};
+unsigned long lastTimeUpdate = 0;
+unsigned long lastMillisAtSync = 0;       // millis() value when last sync happened
+const unsigned long TIME_UPDATE_INTERVAL = 3600000; // Retry sync every hour
+
+// ── Advance software clock using millis() since last sync ──────────
+void tickSoftwareClock() {
+  if (!currentTime.valid) return;
+
+  unsigned long elapsed = (millis() - lastMillisAtSync) / 1000; // seconds elapsed
+  if (elapsed == 0) return;
+
+  lastMillisAtSync += elapsed * 1000;   // consume those seconds
+
+  currentTime.second += elapsed;
+
+  // Carry seconds → minutes → hours → days (simple, no month rollover needed)
+  if (currentTime.second >= 60) {
+    currentTime.minute += currentTime.second / 60;
+    currentTime.second  = currentTime.second % 60;
+  }
+  if (currentTime.minute >= 60) {
+    currentTime.hour  += currentTime.minute / 60;
+    currentTime.minute = currentTime.minute % 60;
+  }
+  if (currentTime.hour >= 24) {
+    currentTime.day  += currentTime.hour / 24;
+    currentTime.hour  = currentTime.hour % 24;
+  }
+}
+
 // ================== DAILY STATS ==================
 struct DailyStats {
   float minTemp;
@@ -52,6 +104,7 @@ struct DailyStats {
 
 DailyStats todayStats;
 int lastRecordedDay = -1;
+bool dailyReportSentToday = false;  // prevents double-send
 
 void resetDailyStats() {
   todayStats.minTemp = 1000;
@@ -84,45 +137,91 @@ void updateActiveContacts() {
 // ===== FUNCTION PROTOTYPES =====
 String sendATCommand(const char *cmd, uint32_t waitMs);
 bool sendSMS(String phoneNumber, String message);
-bool getNetworkTime(int &hour, int &minute, int &day);
+bool getInternetTime();
 
-bool getNetworkTime(int &hour, int &minute, int &day) {
-  String resp = sendATCommand("AT+CCLK?", 2000);
-  int q1 = resp.indexOf("\"");
-  int q2 = resp.indexOf("\"", q1 + 1);
-  if (q1 < 0 || q2 < 0) return false;
+// GET TIME VIA NETWORK (AT+CLTS + AT+CCLK)
+// AT+CLTS=1 tells the modem to accept time from the cell tower on registration.
+// We then re-trigger registration, wait up to 30s for a valid time, and read CCLK.
+// We always ignore the modem's timezone offset and apply IST (UTC+5:30 = +330 min) ourselves.
+bool getInternetTime() {
 
-  String t = resp.substring(q1 + 1, q2);
-  
-  // Check if time is valid (not 1970)
-  String year = t.substring(0, 2);
-  if (year.toInt() < 20) {
-    Serial.println("⚠ Network time not synchronized yet");
+  Serial.println("🌍 Syncing time via NTP (UTC -> IST)...");
+
+  sendATCommand("AT+CGATT=1", 2000);
+  sendATCommand("AT+CGACT=1,1", 3000);
+
+  // Force UTC
+  sendATCommand("AT+CNTP=\"pool.ntp.org\",0", 2000);
+  sendATCommand("AT+CNTP", 10000);
+
+  delay(3000);
+
+  String cclk = sendATCommand("AT+CCLK?", 2000);
+
+  int q = cclk.indexOf('"');
+  if (q < 0) {
+    Serial.println("❌ Failed to read time");
     return false;
   }
-  
-  day = t.substring(6, 8).toInt();
-  hour = t.substring(9, 11).toInt();
-  minute = t.substring(12, 14).toInt();
+
+  String ts = cclk.substring(q + 1);
+
+  int yr = ts.substring(0, 2).toInt() + 2000;
+  int mo = ts.substring(3, 5).toInt();
+  int dy = ts.substring(6, 8).toInt();
+  int hr = ts.substring(9, 11).toInt();
+  int mn = ts.substring(12, 14).toInt();
+  int sc = ts.substring(15, 17).toInt();
+
+  // 🔥 Convert UTC → IST (+5:30)
+  hr += 5;
+  mn += 30;
+
+  if (mn >= 60) {
+    mn -= 60;
+    hr += 1;
+  }
+
+  if (hr >= 24) {
+    hr -= 24;
+    dy += 1;
+  }
+
+  currentTime = {hr, mn, sc, dy, mo, yr, true};
+  lastMillisAtSync = millis();
+
+  Serial.printf("✅ IST Time Synced: %02d/%02d/%04d %02d:%02d:%02d\n",
+                dy, mo, yr, hr, mn, sc);
+
   return true;
 }
-
 void checkDailyReport() {
   if (!dailyReportEnabled) return;
+  if (!currentTime.valid)  return;
 
-  int hour, minute, day;
-  if (!getNetworkTime(hour, minute, day)) return;
+  // Reset flag at midnight each new day
+  if (currentTime.day != lastRecordedDay) {
+    dailyReportSentToday = false;
+    lastRecordedDay = currentTime.day;
+  }
 
-  if (day != lastRecordedDay && hour == 8 && minute < 5) {
-    String msg = "📊 DAILY REPORT\n";
-    msg += "Temp Min: " + String(todayStats.minTemp,1) + "C\n";
-    msg += "Temp Max: " + String(todayStats.maxTemp,1) + "C\n";
-    msg += "Hum Min: " + String(todayStats.minHum,0) + "%\n";
-    msg += "Hum Max: " + String(todayStats.maxHum,0) + "%";
+  // Send once during hour 8 (08:00-08:59). Flag stops double-send.
+  if (!dailyReportSentToday && currentTime.hour == 8) {
+    dailyReportSentToday = true;  // mark BEFORE sending so slow SMS won't double-fire
 
-    sendSMS(phoneNumbers[0], msg);
+    String msg = "DAILY REPORT\n";
+    msg += "Date: " + String(currentTime.day) + "/" + String(currentTime.month) + "/" + String(currentTime.year) + "\n";
+    msg += "Temp Min: " + String(todayStats.minTemp, 1) + "C  Max: " + String(todayStats.maxTemp, 1) + "C\n";
+    msg += "Hum  Min: " + String(todayStats.minHum,  0) + "%  Max: " + String(todayStats.maxHum,  0) + "%";
 
-    lastRecordedDay = day;
+    Serial.println("Sending daily report to all contacts...");
+    for (int i = 0; i < MAX_CONTACTS; i++) {
+      if (phoneNumbers[i].length() >= 10) {
+        Serial.println("  -> " + phoneNumbers[i]);
+        sendSMS(phoneNumbers[i], msg);
+        delay(2000);
+      }
+    }
     resetDailyStats();
   }
 }
@@ -141,6 +240,9 @@ void checkDailyReport() {
 #define DHTPIN 2
 #define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
+
+// ── DHT11 calibration offset (adjust if reading drifts) ──
+#define TEMP_OFFSET  -5.0f   // Subtract 5°C from DHT11 reading
 
 // ================== SENSORS ==================
 #define MQ_GAS_PIN   34
@@ -161,7 +263,7 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 #define MODEM_RX       27
 
 // ================== WiFi Configuration ==================
-const char* AP_SSID = "EnvMonitor_Config";
+const char* AP_SSID     = "EnvMonitor_Config";
 const char* AP_PASSWORD = "12345678";
 WebServer server(80);
 Preferences preferences;
@@ -201,16 +303,51 @@ unsigned long lastCallAttempt = 0;
 int callAttempts = 0;
 const int MAX_CALL_ATTEMPTS = 5;
 const unsigned long CALL_TIMEOUT = 45000;
-const unsigned long RETRY_DELAY = 3000;  // ✅ REDUCED TO 3 SECONDS
+const unsigned long RETRY_DELAY = 3000;
 const unsigned long ALERT_COOLDOWN = 300000;
 unsigned long alertCooldownStart = 0;
 
 String currentAlertType = "";
 bool callInProgress = false;
 
-// ================== DISPLAY TEST MODE ==================
-#define DISPLAY_TEST_MODE false
-#define X_OFFSET 0
+// ✅ BUZZER UPDATE - defined here so CallState enum is in scope
+void buzzerUpdate(bool alertActive) {
+  if (!buzzerEnabled) {
+    if (buzzerActive) {
+      buzzerActive = false;
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+    return;
+  }
+
+  // Stop buzzer immediately when call is answered
+  if (callState == CALL_CONNECTED && buzzerActive) {
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    return;
+  }
+
+  if (alertActive) {
+    if (!buzzerActive) {
+      buzzerActive = true;
+      buzzerLastToggle = millis();
+      digitalWrite(BUZZER_PIN, HIGH);
+    }
+    // Fast ringtone during call, slow beep otherwise
+    unsigned long interval = (callState == CALL_DIALING || callState == CALL_RINGING)
+                             ? BUZZER_CALL_INTERVAL
+                             : BUZZER_ALERT_INTERVAL;
+    if (millis() - buzzerLastToggle >= interval) {
+      buzzerLastToggle = millis();
+      digitalWrite(BUZZER_PIN, !digitalRead(BUZZER_PIN));
+    }
+  } else {
+    if (buzzerActive) {
+      buzzerActive = false;
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+}
   
 // ================== WEB SERVER HTML ==================
 const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
@@ -315,6 +452,9 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
   <div><strong>Daily Report:</strong> Enabled (8:00 AM)</div>
   <div><strong>Temperature:</strong> <span id="displayTemp">Loading...</span> °C</div>
   <div><strong>Humidity:</strong> <span id="displayHum">Loading...</span> %</div>
+  <div><strong>CO Limit:</strong> <span id="displayGas">Loading...</span> PPM</div>
+  <div><strong>NH3 Limit:</strong> <span id="displayNH3">Loading...</span> PPM</div>
+  <div><strong>Buzzer:</strong> <span id="displayBuzzer">Loading...</span></div>
 </div>
 
 <form id="configForm">
@@ -343,6 +483,25 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
     <input type="number" step="0.1" id="hlow" placeholder="Min (e.g., 30)" required>
     <input type="number" step="0.1" id="hhigh" placeholder="Max (e.g., 80)" required>
   </div>
+</div>
+
+<h2>Gas Thresholds</h2>
+<div class="form-group">
+  <label>Carbon Monoxide Limit (PPM)</label>
+  <input type="number" id="gasLimit" placeholder="e.g., 1800" required>
+</div>
+<div class="form-group">
+  <label>Ammonia Limit (PPM)</label>
+  <input type="number" id="nh3Limit" placeholder="e.g., 200" required>
+</div>
+
+<h2>Alert Settings</h2>
+<div class="form-group">
+  <label style="display: flex; align-items: center; cursor: pointer;">
+    <input type="checkbox" id="buzzerEnabled" style="width: auto; margin-right: 10px;">
+    <span>Enable Buzzer Alerts</span>
+  </label>
+  <p class="hint">Uncheck to disable buzzer (calls and SMS will still work)</p>
 </div>
 
 <button type="submit">Save All Settings</button>
@@ -375,6 +534,9 @@ function loadSettings() {
       document.getElementById('thigh').value = data.thigh ?? '';
       document.getElementById('hlow').value  = data.hlow ?? '';
       document.getElementById('hhigh').value = data.hhigh ?? '';
+      document.getElementById('gasLimit').value = data.gasLimit ?? '';
+      document.getElementById('nh3Limit').value = data.nh3Limit ?? '';
+      document.getElementById('buzzerEnabled').checked = data.buzzerEnabled !== false;
 
       displayTemp.textContent =
         (data.tlow !== undefined && data.thigh !== undefined)
@@ -385,6 +547,16 @@ function loadSettings() {
         (data.hlow !== undefined && data.hhigh !== undefined)
           ? data.hlow + ' to ' + data.hhigh
           : 'Not configured';
+
+      displayGas.textContent = data.gasLimit !== undefined
+        ? data.gasLimit
+        : 'Not configured';
+
+      displayNH3.textContent = data.nh3Limit !== undefined
+        ? data.nh3Limit
+        : 'Not configured';
+
+      displayBuzzer.textContent = (data.buzzerEnabled !== false) ? 'Enabled' : 'Disabled';
     });
 }
 
@@ -403,7 +575,10 @@ document.getElementById('configForm').addEventListener('submit', e => {
     'tlow=' + tlow.value +
     '&thigh=' + thigh.value +
     '&hlow=' + hlow.value +
-    '&hhigh=' + hhigh.value;
+    '&hhigh=' + hhigh.value +
+    '&gasLimit=' + gasLimit.value +
+    '&nh3Limit=' + nh3Limit.value +
+    '&buzzerEnabled=' + (buzzerEnabled.checked ? '1' : '0');
 
   fetch('/setSettings', {
     method: 'POST',
@@ -431,6 +606,12 @@ function testCall() {
 </body>
 </html>
 )rawliteral";
+
+// ================== BUZZER FUNCTIONS ==================
+void buzzerInit() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+}
 
 // ================== A7670 MODEM FUNCTIONS ==================
 void powerOnModem() {
@@ -751,70 +932,22 @@ void resetCallState() {
   callState = CALL_IDLE;
 }
 
-// ✅ NEW FUNCTION: Get Alert Reasons
-String getAlertReasons(float temp, float hum, int gas, int nh3, bool fire) {
-  String reason = "";
-
-  if (fire)
-    reason += "🔥 FIRE DETECTED\n";
-
-  if (temp < TEMP_LOW)
-    reason += "❄ TEMP LOW (" + String(temp,1) + "C)\n";
-  else if (temp > TEMP_HIGH)
-    reason += "🔥 TEMP HIGH (" + String(temp,1) + "C)\n";
-
-  if (hum < HUM_LOW)
-    reason += "💧 HUMIDITY LOW (" + String(hum,0) + "%)\n";
-  else if (hum > HUM_HIGH)
-    reason += "💧 HUMIDITY HIGH (" + String(hum,0) + "%)\n";
-
-  if (gas > GAS_LIMIT)
-    reason += "🧪 GAS HIGH (" + String(gas) + " PPM)\n";
-
-  if (nh3 > AMMONIA_LIMIT)
-    reason += "☠ AMMONIA HIGH (" + String(nh3) + " PPM)\n";
-
-  if (reason == "") reason = "Unknown alert\n";
-
-  return reason;
-}
-
-// ✅ COMBINED SMS: Stats + Alert Reason (Single Message)
-void sendCallAlertSMS(String phone, int attempt,
-                      float temp, float hum, int gas, int nh3, bool fire) {
-
-  String msg = "ALERT #" + String(attempt) + "\n";
-  
-  // Alert reasons
-  if (fire) msg += "FIRE! ";
-  if (temp < TEMP_LOW) msg += "COLD ";
-  if (temp > TEMP_HIGH) msg += "HOT ";
-  if (hum < HUM_LOW) msg += "DRY ";
-  if (hum > HUM_HIGH) msg += "WET ";
-  if (gas > GAS_LIMIT) msg += "GAS ";
-  if (nh3 > AMMONIA_LIMIT) msg += "NH3 ";
-  
-  msg += "\n";
-  
-  // Current values
-  msg += "T:" + String(temp,1) + "C ";
-  msg += "H:" + String(hum,0) + "% ";
-  msg += "G:" + String(gas) + " ";
-  msg += "N:" + String(nh3);
-  msg += "\nCalling now";
-
+// ALERT SMS - formatted
+void sendAlertSMS(String phone, float temp, float hum, int gas, int nh3, bool fire) {
+  String msg = "ALERT\n";
+  msg += "Temperature: " + String(temp, 1) + "C\n";
+  msg += "Humidity: "    + String((int)hum) + "%\n";
+  msg += "Carbon Monoxide: " + String(gas) + "\n";
+  msg += "Ammonia: "     + String(nh3) + "\n";
+  msg += "Reason:";
+  if (fire)                 msg += " Fire detected";
+  if (temp < TEMP_LOW)      msg += " Temp below "     + String((int)TEMP_LOW);
+  if (temp > TEMP_HIGH)     msg += " Temp above "     + String((int)TEMP_HIGH);
+  if (hum  < HUM_LOW)       msg += " Humidity below " + String((int)HUM_LOW);
+  if (hum  > HUM_HIGH)      msg += " Humidity above " + String((int)HUM_HIGH);
+  if (gas  > GAS_LIMIT)     msg += " CO above limit " + String(GAS_LIMIT);
+  if (nh3  > AMMONIA_LIMIT) msg += " NH3 above limit "+ String(AMMONIA_LIMIT);
   sendSMS(phone, msg);
-}
-
-void sendParametersSMS(float temp, float hum, int gas, int nh3, bool fire) {
-  String message = "ENV MONITOR:\n";
-  message += "Temp: " + String(temp, 1) + "C\n";
-  message += "Humidity: " + String(hum, 0) + "%\n";
-  message += "Carbon Monoxide: " + String(gas) + " PPM\n";
-  message += "Ammonia: " + String(nh3) + " PPM\n";
-  message += "Fire: " + String(fire ? "YES" : "NO");
-  
-  sendSMS(phoneNumbers[0], message);
 }
 
 // ✅ UPDATED handleAlerts Function
@@ -827,8 +960,12 @@ void handleAlerts(float temp, float hum, int gas, int nh3, bool fire) {
     (gas > GAS_LIMIT) ||
     (nh3 > AMMONIA_LIMIT);
 
+  // ✅ BUZZER CONTROL
+  buzzerUpdate(alertActive);
+
   if (!alertActive) {
     resetCallState();
+    smsSentForCurrentAlert = false;
     return;
   }
 
@@ -841,8 +978,10 @@ void handleAlerts(float temp, float hum, int gas, int nh3, bool fire) {
     return;
   }
 
+  // ✅ LOOP BACK TO FIRST CONTACT AFTER TRYING ALL
   if (currentContactIndex >= activeContacts) {
     currentContactIndex = 0;
+    Serial.println("🔄 All contacts tried, starting from first contact again");
   }
 
   if (millis() - lastCallAttempt < RETRY_DELAY) return;
@@ -853,12 +992,8 @@ void handleAlerts(float temp, float hum, int gas, int nh3, bool fire) {
     attemptsForCurrentNumber + 1
   );
 
-  // ✅ SEND SMS WITH EACH CALL
-  sendCallAlertSMS(
-    activePhoneList[currentContactIndex],
-    attemptsForCurrentNumber + 1,
-    temp, hum, gas, nh3, fire
-  );
+  // ✅ SEND COMBINED SMS WITH EACH CALL
+  sendAlertSMS(activePhoneList[currentContactIndex], temp, hum, gas, nh3, fire);
 
   makeDirectCall(activePhoneList[currentContactIndex]);
 
@@ -887,6 +1022,9 @@ void handleGetSettings() {
   json += "\"thigh\":" + String(TEMP_HIGH, 1) + ",";
   json += "\"hlow\":" + String(HUM_LOW, 1) + ",";
   json += "\"hhigh\":" + String(HUM_HIGH, 1) + ",";
+  json += "\"gasLimit\":" + String(GAS_LIMIT) + ",";
+  json += "\"nh3Limit\":" + String(AMMONIA_LIMIT) + ",";
+  json += "\"buzzerEnabled\":" + String(buzzerEnabled ? "true" : "false") + ",";
   json += "\"dailyReport\":" + String(dailyReportEnabled ? "true" : "false");
 
   json += "}";
@@ -905,11 +1043,17 @@ void handleSetSettings() {
   TEMP_HIGH = server.arg("thigh").toFloat();
   HUM_LOW   = server.arg("hlow").toFloat();
   HUM_HIGH  = server.arg("hhigh").toFloat();
+  GAS_LIMIT = server.arg("gasLimit").toInt();
+  AMMONIA_LIMIT = server.arg("nh3Limit").toInt();
+  buzzerEnabled = (server.arg("buzzerEnabled") == "1");
 
   preferences.putFloat("tlow", TEMP_LOW);
   preferences.putFloat("thigh", TEMP_HIGH);
   preferences.putFloat("hlow", HUM_LOW);
   preferences.putFloat("hhigh", HUM_HIGH);
+  preferences.putInt("gasLimit", GAS_LIMIT);
+  preferences.putInt("nh3Limit", AMMONIA_LIMIT);
+  preferences.putBool("buzzerEnabled", buzzerEnabled);
 
   updateActiveContacts();
 
@@ -927,24 +1071,6 @@ void handleTestCall() {
 }
 
 // ================== DISPLAY UTILITIES ==================
-void lcdScanAnimation() {
-  tft.fillScreen(ST77XX_BLACK);
-
-  for (int y = 0; y < 240; y += 8) {
-    tft.drawFastHLine(0, y, 240, 0x18E3);
-  }
-
-  for (int y = 0; y < 240; y += 4) {
-    tft.fillRect(0, y - 4, 240, 8, ST77XX_BLACK);
-    tft.drawFastHLine(0, y, 240, ST77XX_CYAN);
-    delay(6);
-  }
-
-  tft.fillScreen(ST77XX_CYAN);
-  delay(80);
-  tft.fillScreen(ST77XX_BLACK);
-}
-
 void drawRoundedCard(int x, int y, int w, int h, uint16_t bgColor, uint16_t borderColor) {
   tft.fillRoundRect(x, y, w, h, 6, bgColor);
   tft.drawRoundRect(x, y, w, h, 6, borderColor);
@@ -976,90 +1102,90 @@ void drawSensorCard(int x, int y, int w, int h, const char* label, String value,
   tft.print(unit);
 }
 
-void drawStatusBar(int y, const char* text, uint16_t bgColor, uint16_t textColor) {
-  tft.fillRect(0, y, 240, 32, bgColor);
+void drawStatusBar(int y, int h, const char* text, uint16_t bgColor, uint16_t textColor) {
+  tft.fillRect(0, y, 280, h, bgColor);
   tft.setTextSize(2);
   tft.setTextColor(textColor);
   int16_t x1, y1;
   uint16_t tw, th;
   tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
-  tft.setCursor((240 - tw) / 2, y + 8);
+  tft.setCursor((280 - tw) / 2, y + (h - th) / 2);
   tft.print(text);
-  
+
   if (callState == CALL_DIALING || callState == CALL_RINGING) {
-    tft.fillCircle(15, y + 16, 5, ST77XX_ORANGE);
-    tft.fillCircle(225, y + 16, 5, ST77XX_ORANGE);
+    tft.fillCircle(10, y + h/2, 5, ST77XX_ORANGE);
+    tft.fillCircle(270, y + h/2, 5, ST77XX_ORANGE);
   } else if (callState == CALL_CONNECTED) {
-    tft.fillCircle(15, y + 16, 5, ST77XX_GREEN);
-    tft.fillCircle(225, y + 16, 5, ST77XX_GREEN);
+    tft.fillCircle(10, y + h/2, 5, ST77XX_GREEN);
+    tft.fillCircle(270, y + h/2, 5, ST77XX_GREEN);
   }
 }
 
 void updateDisplay(float t, float h, int gas, int nh3, int flame) {
+  // ── Full landscape layout: 280 wide × 240 tall ──────────────────
+  // y=  0  h=30  Header bar
+  // y= 30  h=  1  divider
+  // y= 31  h=86  Card row 1  (TEMP left | HUMIDITY right)
+  // y=117  h=  1  divider
+  // y=118  h=86  Card row 2  (GAS left  | AMMONIA right)
+  // y=204  h=  1  divider
+  // y=205  h=35  Status bar   ← fills to y=240, no gap
+  // Total = 240 ✓
+  // Width: each half = 138px, gap=4px → card w=136
+
   tft.fillScreen(0x0000);
-  
-  tft.fillRect(0, 0, 240, 28, 0x0349);
+
+  // ── HEADER ──────────────────────────────────────────────────────
+  tft.fillRect(0, 0, 280, 30, 0x0349);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(20, 6);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds("ENVIRONMENT", 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor((280 - tw) / 2, 7);
   tft.print("ENVIRONMENT");
-  
-  uint16_t indicatorColor = ST77XX_GREEN;
-  if (callState == CALL_DIALING || callState == CALL_RINGING) {
-    indicatorColor = ST77XX_ORANGE;
-  } else if (callState == CALL_CONNECTED) {
-    indicatorColor = ST77XX_CYAN;
-  } else if (callAttempts > 0) {
-    indicatorColor = ST77XX_YELLOW;
-  }
-  tft.fillCircle(220, 14, 5, indicatorColor);
-  
+
+  // Status dot top-right
+  uint16_t dotColor = ST77XX_GREEN;
+  if      (callState == CALL_DIALING || callState == CALL_RINGING) dotColor = ST77XX_ORANGE;
+  else if (callState == CALL_CONNECTED)                             dotColor = ST77XX_CYAN;
+  else if (callAttempts > 0)                                        dotColor = ST77XX_YELLOW;
+  tft.fillCircle(255, 15, 6, dotColor);
+
+  tft.drawFastHLine(0, 30, 280, 0x4208);
+
+  // ── SENSOR CARD ROW 1  y=31  h=86 ──────────────────────────────
   bool tempAlert = (t < TEMP_LOW || t > TEMP_HIGH);
-  String tempStr = String(t, 1);
-  drawSensorCard(5, 35, 110, 70, "TEMPERATURE", tempStr, "C", 
+  bool humAlert  = (h < HUM_LOW  || h > HUM_HIGH);
+
+  drawSensorCard(2,  31, 136, 86, "TEMPERATURE", String(t, 1), "C",
                  tempAlert ? ST77XX_RED : ST77XX_CYAN, tempAlert);
-  
-  bool humAlert = (h < HUM_LOW || h > HUM_HIGH);
-  String humStr = String(h, 0);
-  drawSensorCard(125, 35, 110, 70, "HUMIDITY", humStr, "%", 
-                 humAlert ? ST77XX_RED : ST77XX_CYAN, humAlert);
-  
-  bool gasAlert = gas > GAS_LIMIT;
-  String gasStr = String(gas);
-  drawSensorCard(5, 112, 110, 70, "GAS LEVEL", gasStr, "PPM", 
+  drawSensorCard(142, 31, 136, 86, "HUMIDITY",    String(h, 0),  "%",
+                 humAlert  ? ST77XX_RED : ST77XX_CYAN, humAlert);
+
+  tft.drawFastHLine(0, 117, 280, 0x4208);
+
+  // ── SENSOR CARD ROW 2  y=118  h=86 ─────────────────────────────
+  bool gasAlert = (gas > GAS_LIMIT);
+  bool nh3Alert = (nh3 > AMMONIA_LIMIT);
+
+  drawSensorCard(2,  118, 136, 86, "GAS (CO)", String(gas), "PPM",
                  gasAlert ? ST77XX_RED : ST77XX_GREEN, gasAlert);
-  
-  bool nh3Alert = nh3 > AMMONIA_LIMIT;
-  String nh3Str = String(nh3);
-  drawSensorCard(125, 112, 110, 70, "AMMONIA", nh3Str, "PPM", 
+  drawSensorCard(142, 118, 136, 86, "AMMONIA",  String(nh3), "PPM",
                  nh3Alert ? ST77XX_RED : ST77XX_GREEN, nh3Alert);
-  
+
+  tft.drawFastHLine(0, 204, 280, 0x4208);
+
+  // ── STATUS BAR  y=205  h=35  (fills exactly to y=240) ───────────
   if (flame == LOW) {
-    drawStatusBar(189, "! FIRE DETECTED !", ST77XX_RED, ST77XX_WHITE);
-    tft.fillCircle(15, 205, 6, ST77XX_YELLOW);
-    tft.fillCircle(225, 205, 6, ST77XX_YELLOW);
+    drawStatusBar(205, 35, "!!! FIRE DETECTED !!!", ST77XX_RED, ST77XX_WHITE);
+  } else if (tempAlert || gasAlert || nh3Alert || humAlert) {
+    if      (callState == CALL_CONNECTED) drawStatusBar(205, 35, "CALL CONNECTED",  ST77XX_GREEN, ST77XX_WHITE);
+    else if (callState == CALL_RINGING)   drawStatusBar(205, 35, "CALLING...",       0xFD20,       ST77XX_WHITE);
+    else if (callAttempts > 0)            drawStatusBar(205, 35, "ALERT - CALLING",  ST77XX_RED,   ST77XX_WHITE);
+    else                                  drawStatusBar(205, 35, "ALERT ACTIVE",     0xF800,       ST77XX_WHITE);
+  } else {
+    drawStatusBar(205, 35, "ALL SYSTEMS OK", 0x0560, ST77XX_WHITE);
   }
-  else if (tempAlert || gasAlert || nh3Alert || humAlert) {
-    if (callState == CALL_CONNECTED) {
-      drawStatusBar(189, "CALL CONNECTED", ST77XX_GREEN, ST77XX_WHITE);
-    } else if (callState == CALL_RINGING) {
-      drawStatusBar(189, "CALLING...", 0xFD20, ST77XX_WHITE);
-    } else if (callAttempts > 0) {
-      drawStatusBar(189, "ALERT - CALLING", ST77XX_RED, ST77XX_WHITE);
-    } else {
-      drawStatusBar(189, "ALERT ACTIVE", 0xF800, ST77XX_WHITE);
-    }
-    tft.drawTriangle(15, 211, 20, 199, 25, 211, ST77XX_YELLOW);
-    tft.drawTriangle(215, 211, 220, 199, 225, 211, ST77XX_YELLOW);
-  }
-  else {
-    drawStatusBar(189, "ALL SYSTEMS OK", 0x0560, ST77XX_WHITE);
-    tft.fillCircle(15, 205, 4, ST77XX_GREEN);
-    tft.fillCircle(225, 205, 4, ST77XX_GREEN);
-  }
-  
-  tft.drawFastHLine(0, 28, 240, 0x4208);
-  tft.drawFastHLine(0, 188, 240, 0x4208);
 }
 
 // ================== SETUP ==================
@@ -1071,45 +1197,38 @@ void setup() {
 
   pinMode(FLAME_PIN, INPUT);
   dht.begin();
+  buzzerInit(); // ✅ Initialize buzzer
   Serial.println("✓ Sensors initialized");
 
+  // ✅ 240x280 ST7789 — landscape via rotation=1 gives 280w x 240h
+  // The chip has a 320-line framebuffer; setAddrWindow pins the 280-line
+  // panel to the correct region so there is no black gap.
   tft.init(240, 280);
-  tft.setRotation(1);
-  tft.setAddrWindow(X_OFFSET, 0, 240 + X_OFFSET, 240);
+  tft.setRotation(1);          // landscape: 280 wide × 240 tall
+  tft.setAddrWindow(0, 0, 280, 240);
   tft.fillScreen(ST77XX_BLACK);
 
-  tft.fillScreen(ST77XX_BLACK);
-
+  // Startup animation — full landscape 280×240
   for (int y = 0; y < 240; y += 4) {
-    tft.drawFastHLine(0, y, 240, ST77XX_CYAN);
-    delay(6);
-    tft.drawFastHLine(0, y, 240, ST77XX_BLACK);
+    tft.drawFastHLine(0, y, 280, ST77XX_CYAN);
+    delay(5);
+    tft.drawFastHLine(0, y, 280, ST77XX_BLACK);
   }
-
-  tft.fillScreen(ST77XX_BLACK);
 
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(3);
   tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(35, 90);
+  int16_t x1, y1; uint16_t tw, th;
+  tft.getTextBounds("ENV", 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor((280 - tw) / 2, 85);
   tft.print("ENV");
-  tft.setCursor(20, 120);
+  tft.getTextBounds("MONITOR", 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor((280 - tw) / 2, 125);
   tft.print("MONITOR");
   delay(1200);
 
   displayReady = true;
   Serial.println("✓ Display ready");
-
-  if (DISPLAY_TEST_MODE) {
-    tft.fillScreen(ST77XX_RED);
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(30, 100);
-    tft.print("DISPLAY");
-    tft.setCursor(55, 140);
-    tft.print("TEST");
-    while (1) delay(1000);
-  }
 
   preferences.begin("envmonitor", false);
 
@@ -1124,6 +1243,9 @@ void setup() {
   TEMP_HIGH = preferences.getFloat("thigh", 35.0);
   HUM_LOW   = preferences.getFloat("hlow", 30.0);
   HUM_HIGH  = preferences.getFloat("hhigh", 80.0);
+  GAS_LIMIT = preferences.getInt("gasLimit", 1800);
+  AMMONIA_LIMIT = preferences.getInt("nh3Limit", 200);
+  buzzerEnabled = preferences.getBool("buzzerEnabled", true);
 
   updateActiveContacts();
   resetDailyStats();
@@ -1149,22 +1271,24 @@ void setup() {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(20, 30);
+  int16_t x1w, y1w; uint16_t tww, thw;
+  tft.getTextBounds("WiFi Ready", 0, 0, &x1w, &y1w, &tww, &thw);
+  tft.setCursor((280 - tww) / 2, 20);
   tft.print("WiFi Ready");
 
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(10, 60);
   tft.print("SSID: "); tft.print(AP_SSID);
-  tft.setCursor(10, 75);
+  tft.setCursor(10, 80);
   tft.print("PASS: "); tft.print(AP_PASSWORD);
-  tft.setCursor(10, 90);
+  tft.setCursor(10, 100);
   tft.print("IP: ");   tft.print(IP);
 
   tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(10, 120);
+  tft.setCursor(10, 130);
   tft.print("Open browser to");
-  tft.setCursor(10, 135);
+  tft.setCursor(10, 148);
   tft.print("configure settings");
 
   delay(4000);
@@ -1175,11 +1299,22 @@ void setup() {
   initModem();
   Serial.println("✓ Modem initialized");
 
+  // ✅ Try to get internet time
+  Serial.println("Attempting to sync time from internet...");
+  if (getInternetTime()) {
+    Serial.println("✅ Time synchronized successfully");
+  } else {
+    Serial.println("⚠ Time sync failed, will retry later");
+  }
+
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_GREEN);
-  tft.setCursor(30, 110);
+  int16_t x1r, y1r; uint16_t twr, thr;
+  tft.getTextBounds("SYSTEM READY", 0, 0, &x1r, &y1r, &twr, &thr);
+  tft.setCursor((280 - twr) / 2, 110);
   tft.print("SYSTEM READY");
+
 
   delay(2000);
   Serial.println("=== MONITORING ACTIVE ===");
@@ -1211,7 +1346,6 @@ int smoothValue(int *buffer, int newValue) {
 
   return sum / count;
 }
-
 
 void processModemURC() {
   static String urc = "";
@@ -1246,12 +1380,25 @@ void loop() {
   processModemURC();
 
   server.handleClient();
+
+  // ── Software clock tick (keeps time even if internet is unavailable) ──
+  tickSoftwareClock();
+
+  // ── Internet time sync: retry every 5 min until first success, then hourly ──
+  unsigned long syncInterval = currentTime.valid ? TIME_UPDATE_INTERVAL : 300000;
+  if (millis() - lastTimeUpdate >= syncInterval) {
+    lastTimeUpdate = millis();
+    getInternetTime();
+  }
   
   if (displayReady && (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL)) {
     lastDisplayUpdate = millis();
     
     float temperature = dht.readTemperature();
-    float humidity = dht.readHumidity();
+    float humidity    = dht.readHumidity();
+
+    // Apply calibration offset BEFORE validation
+    if (!isnan(temperature)) temperature += TEMP_OFFSET;
     int gasADC = analogRead(MQ_GAS_PIN);
     int nh3ADC = analogRead(MQ137_PIN);
 
@@ -1269,8 +1416,8 @@ void loop() {
 
     int flameValue = digitalRead(FLAME_PIN);
     
-    if (isnan(temperature) || temperature < 0 || temperature > 60) temperature = lastValidTemp;
-    if (isnan(humidity) || humidity < 0 || humidity > 100) humidity = lastValidHum;
+    if (isnan(temperature) || temperature < -10 || temperature > 55) temperature = lastValidTemp;
+    if (isnan(humidity)    || humidity < 0       || humidity > 100)   humidity    = lastValidHum;
 
     lastValidTemp = temperature;
     lastValidHum  = humidity;
@@ -1289,26 +1436,6 @@ void loop() {
     Serial.println();
     
     handleAlerts(temperature, humidity, gasValue, nh3Value, flameValue == LOW);
-    
-    bool alertCondition = 
-      (flameValue == LOW) ||
-      (temperature < TEMP_LOW || temperature > TEMP_HIGH) ||
-      (humidity < HUM_LOW || humidity > HUM_HIGH) ||
-      (gasValue > GAS_LIMIT) ||
-      (nh3Value > AMMONIA_LIMIT);
-    
-    if (alertCondition && !lastAlertState) {
-      Serial.println("🚨 ALERT STARTED → Sending SMS");
-      sendParametersSMS(temperature, humidity, gasValue, nh3Value, flameValue == LOW);
-      smsSentForCurrentAlert = true;
-    }
-
-    if (!alertCondition && lastAlertState) {
-      Serial.println("✅ ALERT CLEARED");
-      smsSentForCurrentAlert = false;
-    }
-
-    lastAlertState = alertCondition;
   }
   
   delay(10);
